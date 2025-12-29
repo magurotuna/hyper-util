@@ -12,15 +12,15 @@ use std::time::Duration;
 use futures_core::ready;
 use futures_util::future::Either;
 use http::uri::{Scheme, Uri};
+use hyper::rt::{Sleep, Timer};
 use pin_project_lite::pin_project;
 use socket2::TcpKeepalive;
 use tokio::net::{TcpSocket, TcpStream};
-use tokio::time::Sleep;
 use tracing::{debug, trace, warn};
 
 use super::dns::{self, resolve, GaiResolver, Resolve};
 use super::{Connected, Connection};
-use crate::rt::TokioIo;
+use crate::rt::{TokioIo, TokioTimer};
 
 /// A connector for the `http` scheme.
 ///
@@ -31,9 +31,10 @@ use crate::rt::TokioIo;
 /// Sets the [`HttpInfo`](HttpInfo) value on responses, which includes
 /// transport information such as the remote socket address used.
 #[derive(Clone)]
-pub struct HttpConnector<R = GaiResolver> {
+pub struct HttpConnector<R = GaiResolver, T = TokioTimer> {
     config: Arc<Config>,
     resolver: R,
+    timer: T,
 }
 
 /// Extra information about the transport when an HttpConnector is used.
@@ -225,6 +226,16 @@ impl<R> HttpConnector<R> {
     ///
     /// Takes a [`Resolver`](crate::client::legacy::connect::dns#resolvers-are-services) to handle DNS lookups.
     pub fn new_with_resolver(resolver: R) -> HttpConnector<R> {
+        HttpConnector::new_with_resolver_and_timer(resolver, TokioTimer::new())
+    }
+}
+
+impl<R, T> HttpConnector<R, T> {
+    /// Construct a new HttpConnector with a custom resolver and timer.
+    ///
+    /// Takes a [`Resolver`](crate::client::legacy::connect::dns#resolvers-are-services) to handle DNS lookups,
+    /// and a [`Timer`](hyper::rt::Timer) for timeouts.
+    pub fn new_with_resolver_and_timer(resolver: R, timer: T) -> HttpConnector<R, T> {
         HttpConnector {
             config: Arc::new(Config {
                 connect_timeout: None,
@@ -254,6 +265,7 @@ impl<R> HttpConnector<R> {
                 tcp_user_timeout: None,
             }),
             resolver,
+            timer,
         }
     }
 
@@ -449,16 +461,17 @@ static INVALID_MISSING_SCHEME: &str = "invalid URL, scheme is missing";
 static INVALID_MISSING_HOST: &str = "invalid URL, host is missing";
 
 // R: Debug required for now to allow adding it to debug output later...
-impl<R: fmt::Debug> fmt::Debug for HttpConnector<R> {
+impl<R: fmt::Debug, T: fmt::Debug> fmt::Debug for HttpConnector<R, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpConnector").finish()
     }
 }
 
-impl<R> tower_service::Service<Uri> for HttpConnector<R>
+impl<R, T> tower_service::Service<Uri> for HttpConnector<R, T>
 where
     R: Resolve + Clone + Send + Sync + 'static,
     R::Future: Send,
+    T: Timer + Clone + Send + Sync + 'static,
 {
     type Response = TokioIo<TcpStream>;
     type Error = ConnectError;
@@ -526,9 +539,10 @@ fn get_host_port<'u>(config: &Config, dst: &'u Uri) -> Result<(&'u str, u16), Co
     Ok((host, port))
 }
 
-impl<R> HttpConnector<R>
+impl<R, T> HttpConnector<R, T>
 where
     R: Resolve,
+    T: Timer,
 {
     async fn call_async(&mut self, dst: Uri) -> Result<TokioIo<TcpStream>, ConnectError> {
         let config = &self.config;
@@ -554,7 +568,7 @@ where
             dns::SocketAddrs::new(addrs)
         };
 
-        let c = ConnectingTcp::new(addrs, config);
+        let c = ConnectingTcp::new(addrs, config, &self.timer);
 
         let sock = c.connect().await?;
 
@@ -703,14 +717,15 @@ impl StdError for ConnectError {
     }
 }
 
-struct ConnectingTcp<'a> {
+struct ConnectingTcp<'a, T> {
     preferred: ConnectingTcpRemote,
     fallback: Option<ConnectingTcpFallback>,
     config: &'a Config,
+    timer: &'a T,
 }
 
-impl<'a> ConnectingTcp<'a> {
-    fn new(remote_addrs: dns::SocketAddrs, config: &'a Config) -> Self {
+impl<'a, T: Timer> ConnectingTcp<'a, T> {
+    fn new(remote_addrs: dns::SocketAddrs, config: &'a Config, timer: &'a T) -> Self {
         if let Some(fallback_timeout) = config.happy_eyeballs_timeout {
             let (preferred_addrs, fallback_addrs) = remote_addrs
                 .split_by_preference(config.local_address_ipv4, config.local_address_ipv6);
@@ -719,29 +734,32 @@ impl<'a> ConnectingTcp<'a> {
                     preferred: ConnectingTcpRemote::new(preferred_addrs, config.connect_timeout),
                     fallback: None,
                     config,
+                    timer,
                 };
             }
 
             ConnectingTcp {
                 preferred: ConnectingTcpRemote::new(preferred_addrs, config.connect_timeout),
                 fallback: Some(ConnectingTcpFallback {
-                    delay: tokio::time::sleep(fallback_timeout),
+                    delay: timer.sleep(fallback_timeout),
                     remote: ConnectingTcpRemote::new(fallback_addrs, config.connect_timeout),
                 }),
                 config,
+                timer,
             }
         } else {
             ConnectingTcp {
                 preferred: ConnectingTcpRemote::new(remote_addrs, config.connect_timeout),
                 fallback: None,
                 config,
+                timer,
             }
         }
     }
 }
 
 struct ConnectingTcpFallback {
-    delay: Sleep,
+    delay: Pin<Box<dyn Sleep>>,
     remote: ConnectingTcpRemote,
 }
 
@@ -762,11 +780,15 @@ impl ConnectingTcpRemote {
 }
 
 impl ConnectingTcpRemote {
-    async fn connect(&mut self, config: &Config) -> Result<TcpStream, ConnectError> {
+    async fn connect<T: Timer>(
+        &mut self,
+        config: &Config,
+        timer: &T,
+    ) -> Result<TcpStream, ConnectError> {
         let mut err = None;
         for addr in &mut self.addrs {
             debug!("connecting to {}", addr);
-            match connect(&addr, config, self.connect_timeout)?.await {
+            match connect(&addr, config, self.connect_timeout, timer)?.await {
                 Ok(tcp) => {
                     debug!("connected to {}", addr);
                     return Ok(tcp);
@@ -820,10 +842,11 @@ fn bind_local_address(
     Ok(())
 }
 
-fn connect(
+fn connect<T: Timer>(
     addr: &SocketAddr,
     config: &Config,
     connect_timeout: Option<Duration>,
+    timer: &T,
 ) -> Result<impl Future<Output = Result<TcpStream, ConnectError>>, ConnectError> {
     // TODO(eliza): if Tokio's `TcpSocket` gains support for setting the
     // keepalive timeout, it would be nice to use that instead of socket2,
@@ -936,28 +959,34 @@ fn connect(
     }
 
     let connect = socket.connect(*addr);
+    let timeout_fut = connect_timeout.map(|dur| timer.sleep(dur));
     Ok(async move {
-        match connect_timeout {
-            Some(dur) => match tokio::time::timeout(dur, connect).await {
-                Ok(Ok(s)) => Ok(s),
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(io::Error::new(io::ErrorKind::TimedOut, e)),
-            },
+        match timeout_fut {
+            Some(timeout) => {
+                futures_util::pin_mut!(connect);
+                futures_util::pin_mut!(timeout);
+                match futures_util::future::select(connect, timeout).await {
+                    Either::Left((result, _)) => result,
+                    Either::Right(((), _)) => {
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+                    }
+                }
+            }
             None => connect.await,
         }
         .map_err(ConnectError::m("tcp connect error"))
     })
 }
 
-impl ConnectingTcp<'_> {
+impl<T: Timer> ConnectingTcp<'_, T> {
     async fn connect(mut self) -> Result<TcpStream, ConnectError> {
         match self.fallback {
-            None => self.preferred.connect(self.config).await,
+            None => self.preferred.connect(self.config, self.timer).await,
             Some(mut fallback) => {
-                let preferred_fut = self.preferred.connect(self.config);
+                let preferred_fut = self.preferred.connect(self.config, self.timer);
                 futures_util::pin_mut!(preferred_fut);
 
-                let fallback_fut = fallback.remote.connect(self.config);
+                let fallback_fut = fallback.remote.connect(self.config, self.timer);
                 futures_util::pin_mut!(fallback_fut);
 
                 let fallback_delay = fallback.delay;
@@ -1172,6 +1201,7 @@ mod tests {
 
         use super::dns;
         use super::ConnectingTcp;
+        use crate::rt::TokioTimer;
 
         let server4 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = server4.local_addr().unwrap();
@@ -1315,7 +1345,8 @@ mod tests {
                         ))]
                         tcp_user_timeout: None,
                     };
-                    let connecting_tcp = ConnectingTcp::new(dns::SocketAddrs::new(addrs), &cfg);
+                    let timer = TokioTimer::new();
+                    let connecting_tcp = ConnectingTcp::new(dns::SocketAddrs::new(addrs), &cfg, &timer);
                     let start = Instant::now();
                     Ok::<_, ConnectError>((start, ConnectingTcp::connect(connecting_tcp).await?))
                 })
